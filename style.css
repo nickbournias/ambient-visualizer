@@ -1,0 +1,41 @@
+/* Optional: keep the card content nicely centered */
+.cardbackground{
+  align-items: center;       /* works since you used d-flex */
+  justify-content: center;
+}
+
+/* Square visualizer tile */
+.viz-wrap{
+  width: min(460px, 100%);   /* square size; caps at 360px, shrinks on small screens */
+  aspect-ratio: 1 / 1;       /* forces a perfect square */
+  display: grid;
+  place-items: center;
+}
+
+/* Canvas fills the square exactly */
+#viz{
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: 18px;       /* match your card softness */
+  background: #0b0c10;       /* fallback if JS hasn’t painted yet */
+}
+
+.viz-meta{
+  margin-top: 14px;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  color: rgba(0,0,0,0.7);
+}
+
+#viz-time{
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+
+#viz-temp{
+  margin-top: 2px;
+  font-size: 13px;
+  opacity: 0.7;
+}
+
