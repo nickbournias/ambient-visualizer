@@ -9,3 +9,32 @@
   height: 400px;
   display: block;
 }
+
+.card2 {
+
+}
+
+.nb-audio-ui {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.nb-audio-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.6;
+}
+
+.nb-audio-ui input[type="file"] {
+  font-size: 12px;
+}
+
+.nb-audio-ui button {
+  padding: 6px 0;
+  font-size: 13px;
+  border: 1px solid currentColor;
+  background: transparent;
+  cursor: pointer;
+}
