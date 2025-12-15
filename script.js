@@ -2,7 +2,7 @@
 import * as THREE from "three";
 
 /* -----------------------------
-   DOM
+   DOM (required)
 ------------------------------ */
 const canvas = document.getElementById("viz");
 if (!canvas) throw new Error('Canvas "#viz" not found');
@@ -10,9 +10,9 @@ if (!canvas) throw new Error('Canvas "#viz" not found');
 const audioEl = document.getElementById("audio");
 const fileEl = document.getElementById("audioFile");
 const playBtn = document.getElementById("audioPlay");
-if (!audioEl || !fileEl || !playBtn) {
-  throw new Error("Need #audio, #audioFile, #audioPlay");
-}
+if (!audioEl || !fileEl || !playBtn) throw new Error("Need #audio, #audioFile, #audioPlay");
+
+playBtn.setAttribute("type", "button");
 
 /* -----------------------------
    THREE
@@ -25,9 +25,6 @@ camera.position.z = 1.2;
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 
-/* -----------------------------
-   Resize
------------------------------- */
 function resize() {
   const r = canvas.getBoundingClientRect();
   const w = Math.max(1, Math.floor(r.width));
@@ -47,49 +44,56 @@ let analyser = null;
 let spectrum = null;
 let mediaSrcNode = null;
 
-function ensureAudio() {
+function ensureAudioGraph() {
   if (audioCtx) return;
 
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 2048;
-  analyser.smoothingTimeConstant = 0.85;
+  analyser.smoothingTimeConstant = 0.78;
   spectrum = new Uint8Array(analyser.frequencyBinCount);
 
-  // Important: createMediaElementSource MUST be created once per <audio> element
   mediaSrcNode = audioCtx.createMediaElementSource(audioEl);
   mediaSrcNode.connect(analyser);
   analyser.connect(audioCtx.destination);
+
+  audioEl.preload = "auto";
+  audioEl.muted = false;
+  audioEl.volume = 1;
 }
 
 fileEl.addEventListener("change", () => {
   const f = fileEl.files?.[0];
   if (!f) return;
-
-  ensureAudio();
-
   audioEl.src = URL.createObjectURL(f);
   audioEl.load();
-
   playBtn.textContent = "Play";
 });
 
-playBtn.addEventListener("click", async () => {
-  ensureAudio();
+playBtn.addEventListener(
+  "click",
+  async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      ensureAudioGraph();
+      if (audioCtx.state !== "running") await audioCtx.resume();
+      if (!audioEl.src) return;
 
-  // Must be called from a user gesture (this click counts)
-  if (audioCtx.state !== "running") await audioCtx.resume();
-
-  if (!audioEl.src) return; // no file chosen yet
-
-  if (audioEl.paused) {
-    await audioEl.play();
-    playBtn.textContent = "Pause";
-  } else {
-    audioEl.pause();
-    playBtn.textContent = "Play";
-  }
-});
+      if (audioEl.paused) {
+        await audioEl.play();
+        playBtn.textContent = "Pause";
+      } else {
+        audioEl.pause();
+        playBtn.textContent = "Play";
+      }
+    } catch (err) {
+      console.error("Audio play failed:", err);
+    }
+  },
+  { passive: false }
+);
 
 /* -----------------------------
    Helpers
@@ -97,7 +101,9 @@ playBtn.addEventListener("click", async () => {
 function lerp(a, b, t) {
   return a + (b - a) * t;
 }
-
+function clamp(x, a, b) {
+  return Math.max(a, Math.min(b, x));
+}
 function bandEnergy(startHz, endHz) {
   if (!audioCtx || !spectrum) return 0;
   const nyquist = audioCtx.sampleRate / 2;
@@ -110,22 +116,28 @@ function bandEnergy(startHz, endHz) {
     sum += spectrum[i];
     count++;
   }
-  return count ? (sum / count) / 255 : 0;
+  return count ? sum / count / 255 : 0;
 }
 
 /* -----------------------------
-   Shader: YOUR palette + audio energize
+   Shader
+   - No mesh scaling
+   - Soft-knee limiter prevents "ballooning"
+   - No "perfect sphere snap" at ceiling
 ------------------------------ */
 const material = new THREE.ShaderMaterial({
   transparent: true,
   side: THREE.FrontSide,
   uniforms: {
     uTime: { value: 0 },
-    uPlay: { value: 0 },     // smoothed 0..1
-    uAmp: { value: 0 },      // smoothed 0..1
-    uBass: { value: 0 },     // smoothed 0..1
-    uMid: { value: 0 },      // smoothed 0..1
-    uHigh: { value: 0 }      // smoothed 0..1
+    uPlay: { value: 0 },
+    uAmp: { value: 0 },
+    uBass: { value: 0 },
+    uMid: { value: 0 },
+    uHigh: { value: 0 },
+    uKick: { value: 0 },
+    uSnare: { value: 0 },
+    uRipple: { value: 0 }
   },
   vertexShader: `
     uniform float uTime;
@@ -134,63 +146,111 @@ const material = new THREE.ShaderMaterial({
     uniform float uBass;
     uniform float uMid;
     uniform float uHigh;
+    uniform float uKick;
+    uniform float uSnare;
+    uniform float uRipple;
 
-    varying vec3 vPos;
+    varying vec3 vBasePos;
+    varying vec3 vViewPos;
+    varying float vFacing;
 
     void main() {
-      float t = uTime * 0.8;
+      float tTime = uTime;
 
-      // Base breathing (your vibe)
-      float wave =
-        sin(position.x * 4.0 + t) +
-        sin(position.y * 5.0 + t * 1.1) +
-        sin(position.z * 6.0 + t * 0.9);
+      vBasePos = position;
 
-      vec3 displaced = position * (1.0 + 0.06 * wave);
+      // Camera-facing mask
+      vec3 nView = normalize(normalMatrix * normal);
+      vFacing = clamp(abs(nView.z), 0.0, 1.0);
+      float faceBoost = mix(0.80, 1.55, vFacing);
 
-      // Audio distortion: smooth + musical (no banding)
+      // Big readable bulge (slow)
+      float bulge =
+        sin(tTime * 1.17 + position.x * 1.21) +
+        sin(tTime * 1.03 + position.y * 1.07) +
+        sin(tTime * 0.91 + position.z * 1.03);
+
+      // Medium undulation
+      float mid =
+        sin(position.x * 5.7 + tTime * 1.05) +
+        sin(position.y * 6.4 + tTime * 0.98) +
+        sin(position.z * 7.1 + tTime * 0.92);
+
+      // Fine detail
       float detail =
-        sin(position.x * 10.0 + t * 1.5) *
-        sin(position.y *  9.0 + t * 1.2) *
-        sin(position.z *  8.0 + t * 1.0);
+        sin(position.x * 10.0 + tTime * 1.75) *
+        sin(position.y *  9.0 + tTime * 1.42) *
+        sin(position.z *  8.0 + tTime * 1.18);
 
-      float distort = (0.02 * uPlay) + (0.06 * uPlay * uBass); // bass drives form
-      displaced += normalize(normal) * detail * distort;
+      // Hit shapes
+      float kickShape = sin(tTime * 9.5 + position.y * 4.0);
+      float snareShape =
+        sin(position.x * 34.0 + tTime * 16.0) *
+        sin(position.y * 22.0 + tTime * 13.0);
 
-      // gentle global “breath push” on loudness
-      displaced *= (1.0 + 0.02 * uPlay * uAmp);
+      // ---- Amplitudes ----
+      float baseBulge = 0.018;
+      float bulgeAmp  = baseBulge + uPlay * (0.070 * uRipple + 0.125 * uBass);
+      float midAmp    = 0.008 + uPlay * (0.030 * uRipple);
+      float detAmp    = uPlay * (0.010 + 0.060 * uHigh) * (0.55 + 0.75 * uRipple);
 
-      vPos = displaced;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
+      float disp = (bulge * bulgeAmp) + (mid * midAmp) + (detail * detAmp);
+
+      // DC cancel (helps "same size" feel)
+      disp -= 0.28 * bulge * bulgeAmp;
+
+      // Hit punches
+      disp += (0.090 * uKick)  * kickShape  * faceBoost;
+      disp += (0.055 * uSnare) * snareShape * faceBoost;
+
+      // Displace along normal only
+      vec3 displaced = position + normalize(normal) * disp * faceBoost;
+
+     // --- soft-limit displacement (tighter so it can't get huge) ---
+float maxDisp = 0.022 + 0.016 * uPlay;
+float knee    = 0.75;
+
+float x = disp / maxDisp;
+x = x / (1.0 + abs(x) / knee);
+disp = x * maxDisp;
+
+
+
+
+      vec4 mv = modelViewMatrix * vec4(displaced, 1.0);
+      vViewPos = mv.xyz;
+      gl_Position = projectionMatrix * mv;
     }
   `,
   fragmentShader: `
+    precision highp float;
+
     uniform float uTime;
     uniform float uPlay;
     uniform float uAmp;
     uniform float uBass;
     uniform float uMid;
     uniform float uHigh;
+    uniform float uKick;
+    uniform float uSnare;
+    uniform float uRipple;
 
-    varying vec3 vPos;
+    varying vec3 vBasePos;
+    varying vec3 vViewPos;
+    varying float vFacing;
 
-    vec3 palette(float t) {
+    vec3 palette(float tt) {
       vec3 a = vec3(0.5);
       vec3 b = vec3(0.5);
       vec3 c = vec3(1.0);
       vec3 d = vec3(0.00, 0.33, 0.67);
-      return a + b * cos(6.28318 * (c * t + d));
+      return a + b * cos(6.28318 * (c * tt + d));
     }
 
     void main() {
       if (!gl_FrontFacing) discard;
 
-      vec3 p = normalize(vPos);
-
-      // Base palette phase (rest look)
-      float baseT = length(vPos) * 1.8 + uTime * 0.25;
-
-      // Keep same palette, but "energize" it musically
+      float baseT = length(vBasePos) * 1.8 + uTime * 0.25;
       float phase = baseT
         + uPlay * (0.35 * uMid)
         + uPlay * (0.18 * uHigh)
@@ -198,254 +258,119 @@ const material = new THREE.ShaderMaterial({
 
       vec3 col = palette(phase);
 
-      // Brightness lift when playing (NO harsh jump)
-      float lift = 1.0 + uPlay * (0.25 * uAmp + 0.15 * uHigh);
-      col *= lift;
+      vec3 dx = dFdx(vViewPos);
+      vec3 dy = dFdy(vViewPos);
+      vec3 n  = normalize(cross(dx, dy));
 
-      // Reduce black without looking washed out
-      col = mix(col, col + 0.12, uPlay * 0.35);
+      vec3 lightDir = normalize(vec3(0.4, 0.3, 1.0));
+      float ndl = clamp(dot(n, lightDir), 0.0, 1.0);
 
-      // very soft rim (not a shell)
-      float rim = 1.0 - smoothstep(0.35, 1.0, abs(p.z));
-      col += rim * (0.06 + 0.10 * uPlay);
+      float belly = smoothstep(0.15, 0.98, vFacing);
+
+      float ambient = 0.56;
+      float diffuse = 0.62 * ndl;
+      float shade = ambient + diffuse + 0.24 * belly;
+
+      vec3 h = normalize(lightDir + vec3(0.0, 0.0, 1.0));
+      float spec = pow(clamp(dot(n, h), 0.0, 1.0), 44.0) * (0.10 + 0.10 * uRipple);
+
+      col *= shade;
+      col += spec;
+
+      col += uKick  * vec3(0.10, 0.06, 0.02);
+      col += uSnare * vec3(0.04, 0.06, 0.10);
+
+      col = mix(col, col + 0.10, uPlay * 0.18 + uRipple * 0.10);
 
       gl_FragColor = vec4(col, 1.0);
     }
   `
 });
 
-/* -----------------------------
-   Main sphere
------------------------------- */
-const SPHERE_RADIUS = 0.45;
-const sphereGeo = new THREE.SphereGeometry(SPHERE_RADIUS, 160, 160);
+const sphereGeo = new THREE.SphereGeometry(0.45, 192, 192);
 const sphere = new THREE.Mesh(sphereGeo, material);
 scene.add(sphere);
 
 /* -----------------------------
-   Click picking
------------------------------- */
-const raycaster = new THREE.Raycaster();
-const mouse = new THREE.Vector2();
-
-/* -----------------------------
-   Bubble explosion + return
------------------------------- */
-let state = "idle"; // "idle" | "explode" | "return"
-let bubbles = [];
-let explodeStart = 0;
-
-const BUBBLE_COUNT = 90;
-const BUBBLE_RADIUS = 0.045;
-
-// timings (seconds)
-const EXPLODE_DURATION = 1.0;   // bounce outward during this
-const HOLD_DURATION = 0.6;      // float a bit
-const RETURN_DURATION = 1.2;    // spring back
-
-// motion tuning
-const OUTWARD_IMPULSE_MIN = 0.020;
-const OUTWARD_IMPULSE_MAX = 0.035;
-const DRAG_EXPLODE = 0.985;
-const DRAG_RETURN = 0.90;
-
-// imaginary boundary for "bounce"
-const BOUNCE_RADIUS = 1.10;
-
-function resetToSphere() {
-  for (const b of bubbles) scene.remove(b);
-  bubbles = [];
-  sphere.visible = true;
-  state = "idle";
-}
-
-function makeBubbles() {
-  const bubbleGeo = new THREE.SphereGeometry(BUBBLE_RADIUS, 24, 24);
-  bubbles = [];
-
-  for (let i = 0; i < BUBBLE_COUNT; i++) {
-    // clone the SAME shader so the palette matches exactly
-    const bMat = material.clone();
-    bMat.uniforms = {
-      uTime: { value: 0 },
-      uPlay: { value: material.uniforms.uPlay.value },
-      uAmp: { value: material.uniforms.uAmp.value },
-      uBass: { value: material.uniforms.uBass.value },
-      uMid: { value: material.uniforms.uMid.value },
-      uHigh: { value: material.uniforms.uHigh.value }
-    };
-
-    const b = new THREE.Mesh(bubbleGeo, bMat);
-
-    // random direction
-    const dir = new THREE.Vector3(
-      Math.random() * 2 - 1,
-      Math.random() * 2 - 1,
-      Math.random() * 2 - 1
-    );
-    if (dir.lengthSq() < 1e-6) dir.set(1, 0, 0);
-    dir.normalize();
-
-    // home position near the sphere surface (so it snaps back cleanly)
-    const home = dir.clone().multiplyScalar(SPHERE_RADIUS * (0.95 + Math.random() * 0.10));
-    b.position.copy(home);
-
-    // outward kick
-    const impulse = OUTWARD_IMPULSE_MIN + Math.random() * (OUTWARD_IMPULSE_MAX - OUTWARD_IMPULSE_MIN);
-    b.userData.vel = dir.clone().multiplyScalar(impulse);
-    b.userData.home = home;
-
-    scene.add(b);
-    bubbles.push(b);
-  }
-}
-
-function explodeAndReturn() {
-  if (state !== "idle") return;
-  explodeStart = performance.now() * 0.001;
-  state = "explode";
-
-  sphere.visible = false;
-  makeBubbles();
-}
-
-canvas.addEventListener(
-  "pointerdown",
-  (e) => {
-    if (state !== "idle") return;
-
-    const r = canvas.getBoundingClientRect();
-    mouse.x = ((e.clientX - r.left) / r.width) * 2 - 1;
-    mouse.y = -(((e.clientY - r.top) / r.height) * 2 - 1);
-
-    raycaster.setFromCamera(mouse, camera);
-    const hit = raycaster.intersectObject(sphere, false);
-    if (hit.length) explodeAndReturn();
-  },
-  { passive: true }
-);
-
-/* -----------------------------
-   Animate
+   Kick/snare detection + Ripple envelope
 ------------------------------ */
 const smooth = { play: 0, amp: 0, bass: 0, mid: 0, high: 0 };
-const tmp = new THREE.Vector3();
-const tmp2 = new THREE.Vector3();
+let prevKickE = 0;
+let prevSnareE = 0;
+let kickPulse = 0;
+let snarePulse = 0;
 
-function pushUniforms(mat) {
-  mat.uniforms.uTime.value = material.uniforms.uTime.value;
-  mat.uniforms.uPlay.value = material.uniforms.uPlay.value;
-  mat.uniforms.uAmp.value = material.uniforms.uAmp.value;
-  mat.uniforms.uBass.value = material.uniforms.uBass.value;
-  mat.uniforms.uMid.value = material.uniforms.uMid.value;
-  mat.uniforms.uHigh.value = material.uniforms.uHigh.value;
-}
+const KICK_DIFF_GAIN = 4.9;
+const SNARE_DIFF_GAIN = 5.5;
+const KICK_DECAY = 0.78;
+const SNARE_DECAY = 0.75;
+
+// Ripple envelope (lingers)
+let rippleEnv = 0;
+const RIPPLE_DECAY = 0.965;
+const RIPPLE_ATTACK = 0.18;
 
 function animate(ms) {
   const t = ms * 0.001;
-
-  // update base uniforms
   material.uniforms.uTime.value = t;
 
   const playing = analyser && !audioEl.paused;
-
-  // smooth play ramp so NOTHING snaps when audio starts
-  smooth.play = lerp(smooth.play, playing ? 1 : 0, 0.05);
+  smooth.play = lerp(smooth.play, playing ? 1 : 0, 0.06);
   material.uniforms.uPlay.value = smooth.play;
 
   if (analyser && spectrum) {
     analyser.getByteFrequencyData(spectrum);
 
-    // bands (tweak if you want)
-    const bass = bandEnergy(20, 140);
-    const mid = bandEnergy(200, 2000);
-    const high = bandEnergy(4000, 12000);
+    const bass = bandEnergy(25, 140);
+    const mid = bandEnergy(220, 2200);
+    const high = bandEnergy(3500, 12000);
 
-    // overall loudness-ish
-    const amp = Math.min(1, (bass * 0.55 + mid * 0.30 + high * 0.25) * 1.15);
+    const amp = clamp((bass * 0.62 + mid * 0.22 + high * 0.34) * 1.08, 0, 1);
 
-    // smooth
-    smooth.bass = lerp(smooth.bass, bass, 0.08);
-    smooth.mid  = lerp(smooth.mid,  mid,  0.08);
-    smooth.high = lerp(smooth.high, high, 0.08);
-    smooth.amp  = lerp(smooth.amp,  amp,  0.08);
+    smooth.bass = lerp(smooth.bass, bass, 0.10);
+    smooth.mid = lerp(smooth.mid, mid, 0.10);
+    smooth.high = lerp(smooth.high, high, 0.10);
+    smooth.amp = lerp(smooth.amp, amp, 0.10);
 
     material.uniforms.uBass.value = smooth.bass;
-    material.uniforms.uMid.value  = smooth.mid;
+    material.uniforms.uMid.value = smooth.mid;
     material.uniforms.uHigh.value = smooth.high;
-    material.uniforms.uAmp.value  = smooth.amp;
+    material.uniforms.uAmp.value = smooth.amp;
+
+    const kickE = bandEnergy(35, 110);
+    const snareE = bandEnergy(1600, 5200);
+
+    const kickDiff = Math.max(0, kickE - prevKickE) * KICK_DIFF_GAIN;
+    const snareDiff = Math.max(0, snareE - prevSnareE) * SNARE_DIFF_GAIN;
+
+    prevKickE = lerp(prevKickE, kickE, 0.35);
+    prevSnareE = lerp(prevSnareE, snareE, 0.35);
+
+    kickPulse = Math.max(kickDiff, kickPulse * KICK_DECAY);
+    snarePulse = Math.max(snareDiff, snarePulse * SNARE_DECAY);
+
+    material.uniforms.uKick.value = clamp(kickPulse, 0, 1) * smooth.play;
+    material.uniforms.uSnare.value = clamp(snarePulse, 0, 1) * smooth.play;
+
+    const targetRipple = clamp(0.55 * smooth.amp + 0.65 * smooth.bass + 0.25 * smooth.high, 0, 1);
+    rippleEnv = Math.max(rippleEnv * RIPPLE_DECAY, lerp(rippleEnv, targetRipple, RIPPLE_ATTACK));
+    material.uniforms.uRipple.value = rippleEnv * smooth.play;
   } else {
-    // decay smoothly to rest if no analyser yet
-    smooth.amp  = lerp(smooth.amp,  0, 0.08);
-    smooth.bass = lerp(smooth.bass, 0, 0.08);
-    smooth.mid  = lerp(smooth.mid,  0, 0.08);
-    smooth.high = lerp(smooth.high, 0, 0.08);
+    material.uniforms.uAmp.value = lerp(material.uniforms.uAmp.value, 0, 0.08);
+    material.uniforms.uBass.value = lerp(material.uniforms.uBass.value, 0, 0.08);
+    material.uniforms.uMid.value = lerp(material.uniforms.uMid.value, 0, 0.08);
+    material.uniforms.uHigh.value = lerp(material.uniforms.uHigh.value, 0, 0.08);
+    material.uniforms.uKick.value = lerp(material.uniforms.uKick.value, 0, 0.12);
+    material.uniforms.uSnare.value = lerp(material.uniforms.uSnare.value, 0, 0.12);
 
-    material.uniforms.uAmp.value  = smooth.amp;
-    material.uniforms.uBass.value = smooth.bass;
-    material.uniforms.uMid.value  = smooth.mid;
-    material.uniforms.uHigh.value = smooth.high;
+    rippleEnv = rippleEnv * 0.95;
+    material.uniforms.uRipple.value = rippleEnv;
   }
 
-  // idle sphere motion
-  if (state === "idle") {
-    sphere.rotation.y = t * 0.35;
-    sphere.rotation.x = t * 0.18;
-  }
-
-  // explode/return lifecycle
-  if (state === "explode" || state === "return") {
-    const elapsed = t - explodeStart;
-
-    if (state === "explode" && elapsed > (EXPLODE_DURATION + HOLD_DURATION)) {
-      state = "return";
-    }
-
-    if (state === "return" && elapsed > (EXPLODE_DURATION + HOLD_DURATION + RETURN_DURATION)) {
-      resetToSphere();
-    }
-
-    for (const b of bubbles) {
-      // keep bubbles on EXACT same color scheme + audio response
-      pushUniforms(b.material);
-
-      const vel = b.userData.vel;
-
-      if (state === "explode") {
-        vel.multiplyScalar(DRAG_EXPLODE);
-
-        // tiny randomness
-        vel.x += (Math.random() - 0.5) * 0.00045;
-        vel.y += (Math.random() - 0.5) * 0.00045;
-        vel.z += (Math.random() - 0.5) * 0.00045;
-
-        b.position.add(vel);
-
-        // bounce off invisible boundary
-        const d = b.position.length();
-        if (d > BOUNCE_RADIUS) {
-          const n = tmp.copy(b.position).multiplyScalar(1 / d);
-          const vn = vel.dot(n);
-          tmp2.copy(n).multiplyScalar(2 * vn);
-          vel.sub(tmp2);
-
-          b.position.copy(n.multiplyScalar(BOUNCE_RADIUS));
-          vel.multiplyScalar(0.85);
-        }
-      } else {
-        // spring toward home + heavy damping
-        vel.multiplyScalar(DRAG_RETURN);
-
-        tmp.copy(b.userData.home).sub(b.position);
-        vel.add(tmp.multiplyScalar(0.06));
-
-        b.position.add(vel);
-      }
-    }
-  }
+  sphere.rotation.y = t * 0.35;
+  sphere.rotation.x = t * 0.18;
 
   renderer.render(scene, camera);
   requestAnimationFrame(animate);
 }
-
 requestAnimationFrame(animate);
