@@ -38,3 +38,26 @@
   background: transparent;
   cursor: pointer;
 }
+
+/* Stack the two cards ONLY on phone widths */
+@media (max-width: 576px) {
+  .nb-stack-row {
+    flex-direction: column !important;
+  }
+
+  .nb-stack-row > [class^="col-"],
+  .nb-stack-row > [class*=" col-"] {
+    width: 100% !important;
+    max-width: 100% !important;
+    flex: 0 0 100% !important;
+  }
+
+  .nb-stack-row > [class^="col-"]:not(:last-child),
+  .nb-stack-row > [class*=" col-"]:not(:last-child) {
+    margin-bottom: 12px;
+  }
+
+  .viz-canvas {
+    height: 320px; /* optional, helps on phones */
+  }
+}
