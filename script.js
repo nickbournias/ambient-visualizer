@@ -1,108 +1,111 @@
-/* ============================================================
-   Ambient Visualizer + Local Time + Local Temperature
-   ============================================================ */
+// viz.js
+import * as THREE from "three";
 
-/* ---------- DOM references ---------- */
-const canvas = document.getElementById('viz');
-const timeEl = document.getElementById('viz-time');
-const tempEl = document.getElementById('viz-temp');
+const canvas = document.getElementById("viz");
+if (!canvas) throw new Error('Canvas "#viz" not found');
 
-if (!canvas) {
-  throw new Error('Canvas #viz not found');
-}
+const scene = new THREE.Scene();
 
-const ctx = canvas.getContext('2d');
-const wrap = canvas.parentElement;
+const camera = new THREE.PerspectiveCamera(70, 1, 0.01, 10);
+camera.position.z = 1.2;
 
-/* ---------- Resize (square canvas) ---------- */
+const renderer = new THREE.WebGLRenderer({
+    canvas,
+    antialias: true,
+    alpha: true
+});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+/* -----------------------------
+   Geometry
+------------------------------ */
+const geometry = new THREE.SphereGeometry(0.45, 128, 128);
+
+/* -----------------------------
+   Shader (colorful, no lights)
+------------------------------ */
+const material = new THREE.ShaderMaterial({
+    transparent: true,
+    uniforms: {
+        uTime: { value: 0 }
+    },
+    vertexShader: `
+    uniform float uTime;
+    varying vec3 vPos;
+
+    void main() {
+      vPos = position;
+
+      float t = uTime * 0.8;
+      float wave =
+        sin(position.x * 4.0 + t) +
+        sin(position.y * 5.0 + t * 1.1) +
+        sin(position.z * 6.0 + t * 0.9);
+
+      vec3 displaced = position * (1.0 + 0.06 * wave);
+
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
+    }
+  `,
+    fragmentShader: `
+    uniform float uTime;
+    varying vec3 vPos;
+
+    // simple cosine palette
+    vec3 palette(float t) {
+      vec3 a = vec3(0.5);
+      vec3 b = vec3(0.5);
+      vec3 c = vec3(1.0);
+      vec3 d = vec3(0.00, 0.33, 0.67);
+      return a + b * cos(6.28318 * (c * t + d));
+    }
+
+    void main() {
+      float t = length(vPos) * 1.8 + uTime * 0.25;
+      vec3 color = palette(t);
+      float rim = 1.0 - smoothstep(0.2, 1.0, abs(normalize(vPos).z));
+      color += rim * 0.15;
+      gl_FragColor = vec4(color, 1.0);
+    }
+  `
+});
+
+const mesh = new THREE.Mesh(geometry, material);
+scene.add(mesh);
+
+/* -----------------------------
+   Resize
+------------------------------ */
 function resize() {
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
-  const size = wrap.clientWidth;
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.max(1, rect.width);
+    const h = Math.max(1, rect.height);
 
-  canvas.width = Math.floor(size * dpr);
-  canvas.height = Math.floor(size * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
 }
 
-window.addEventListener('resize', resize);
+window.addEventListener("resize", resize);
 resize();
 
-/* ---------- Organic wave function ---------- */
-function organic(x, t) {
-  return (
-    Math.sin(x * 0.010 + t * 1.0) * 0.6 +
-    Math.sin(x * 0.004 - t * 0.7) * 0.3 +
-    Math.sin(x * 0.021 + t * 0.4) * 0.1
-  );
+/* -----------------------------
+   Animate
+------------------------------ */
+function animate(time) {
+    const t = time * 0.001;
+
+    material.uniforms.uTime.value = t;
+
+    mesh.rotation.x = Math.sin(t * 0.6) * 0.35;
+    mesh.rotation.y = Math.cos(t * 0.45) * 0.6;
+
+    camera.position.x = Math.sin(t * 0.25) * 0.15;
+    camera.position.y = Math.cos(t * 0.32) * 0.12;
+    camera.lookAt(0, 0, 0);
+
+    renderer.render(scene, camera);
+    requestAnimationFrame(animate);
 }
 
-/* ---------- Animation loop ---------- */
-let t = 0;
-
-function frame() {
-  const size = wrap.clientWidth;
-  const center = size * 0.5;
-
-  // Fade previous frame (soft trails)
-  ctx.fillStyle = 'rgba(11, 12, 16, 0.12)';
-  ctx.fillRect(0, 0, size, size);
-
-  // Wave styling
-  ctx.strokeStyle = 'rgba(232, 232, 232, 0.10)';
-  ctx.lineWidth = 1.2;
-
-  ctx.beginPath();
-  for (let x = 0; x <= size; x += 8) {
-    const y = center + organic(x, t) * size * 0.18;
-    if (x === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-
-  t += 0.015;
-  requestAnimationFrame(frame);
-}
-
-// Initial paint
-ctx.fillStyle = '#0b0c10';
-ctx.fillRect(0, 0, wrap.clientWidth, wrap.clientWidth);
-requestAnimationFrame(frame);
-
-/* ============================================================
-   Local Time (system time, no API)
-   ============================================================ */
-
-function updateTime() {
-  const now = new Date();
-  const h = now.getHours();
-  const m = String(now.getMinutes()).padStart(2, '0');
-  timeEl.textContent = `${h}:${m}`;
-}
-
-updateTime();
-setInterval(updateTime, 60_000);
-
-/* ============================================================
-   Local Temperature (IP-based, no permission)
-   ============================================================ */
-
-async function loadTemperature() {
-  try {
-    // 1) Get approximate location from IP
-    const loc = await fetch('https://ipapi.co/json/')
-      .then(r => r.json());
-
-    // 2) Get current temperature
-    const weather = await fetch(
-      `https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}` +
-      `&current_weather=true&temperature_unit=fahrenheit`
-    ).then(r => r.json());
-
-    const temp = Math.round(weather.current_weather.temperature);
-    tempEl.textContent = `${temp}°F · ${loc.city}`;
-  } catch (err) {
-    tempEl.textContent = 'Weather unavailable';
-  }
-}
-
-loadTemperature();
+requestAnimationFrame(animate);
